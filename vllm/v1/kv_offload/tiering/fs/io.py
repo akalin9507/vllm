@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 # O_DIRECT is Linux-specific and not available on macOS
 O_DIRECT = getattr(os, "O_DIRECT", 0)
+# Windows CRT file descriptors default to text mode; KV blocks are binary data.
+O_BINARY = getattr(os, "O_BINARY", 0)
 
 # Thread-local storage for unique temporary file suffixes
 _thread_local = threading.local()
@@ -52,7 +54,9 @@ def probe_o_direct(directory: str) -> bool:
     path = os.path.join(directory, f".o_direct_probe{_get_tmp_suffix()}")
     page = mmap.mmap(-1, mmap.PAGESIZE)
     try:
-        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | O_DIRECT, 0o644)
+        fd = os.open(
+            path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | O_DIRECT | O_BINARY, 0o644
+        )
         try:
             os.write(fd, page)
         finally:
@@ -112,7 +116,7 @@ def _store_block(
     try:
         fd = os.open(
             tmp_path,
-            os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_TRUNC | o_direct,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_TRUNC | o_direct | O_BINARY,
             0o644,
         )
         try:
@@ -147,9 +151,25 @@ def _load_block(
     o_direct = O_DIRECT if use_o_direct else 0
 
     try:
-        fd = os.open(source_path, os.O_RDONLY | o_direct)
-        bytes_read = os.readv(fd, [view_slice])
+        fd = os.open(source_path, os.O_RDONLY | o_direct | O_BINARY)
+        if hasattr(os, "readv"):
+            bytes_read = os.readv(fd, [view_slice])
+        else:
+            # Windows has no readv(). This fallback is used with buffered I/O
+            # and keeps the same short-read contract as the readv path.
+            data = bytearray()
+            while len(data) < block_size:
+                chunk = os.read(fd, block_size - len(data))
+                if not chunk:
+                    break
+                data.extend(chunk)
+            view_slice[: len(data)] = data
+            bytes_read = len(data)
         if bytes_read < block_size:
+            # Windows does not allow unlinking an open file. Close the
+            # descriptor before removing a provably corrupt short-read file.
+            os.close(fd)
+            fd = None
             # A failure to remove must not mask the short-read error below.
             try:
                 os.remove(source_path)
