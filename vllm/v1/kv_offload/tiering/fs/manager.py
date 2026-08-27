@@ -18,7 +18,9 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
 import functools
 import json
 import os
+import threading
 from collections.abc import Iterable
+from time import time
 from typing import TYPE_CHECKING, ClassVar
 
 try:
@@ -38,6 +40,8 @@ from vllm.v1.kv_offload.base import (
     OffloadingEvent,
     OffloadKey,
     ReqContext,
+    make_offload_key,
+    get_offload_group_idx,
 )
 from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.kv_offload.tiering.async_lookup import AsyncLookupManager
@@ -55,6 +59,11 @@ from vllm.v1.kv_offload.tiering.fs.io import (
     probe_o_direct,
 )
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
+from vllm.v1.kv_offload.tiering.fs.policy import (
+    CacheEntry,
+    CacheMetadataStore,
+    PrefixCostAwareWTinyLFU,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
@@ -117,6 +126,11 @@ class FileSystemTierManager(SecondaryTierManager):
         n_write_threads: int = 16,
         enable_kv_events: bool = False,
         locality: str | None = None,
+        max_bytes: int | None = None,
+        cache_policy: str = "prefix_cost_aware_wtinylfu",
+        recency_half_life_seconds: float = 3600.0,
+        prefix_weight: float = 1.0,
+        prefill_tokens_per_second: float = 1000.0,
     ):
         """
         Args:
@@ -132,8 +146,28 @@ class FileSystemTierManager(SecondaryTierManager):
                 cache events are enabled globally (kv_events_config).
             locality: Whether this tier's storage is LOCAL or REMOTE relative
                 to the publishing vLLM instance.
+            max_bytes: Maximum bytes of block data stored by this rank. ``None``
+                keeps the historical unlimited behavior. The limit excludes
+                ``config.json`` and temporary files.
+            cache_policy: Admission and eviction policy for disk entries.
+            recency_half_life_seconds: Half-life used by the policy's recency
+                and frequency decay.
+            prefix_weight: Weight for shallow/shared prefix entries.
+            prefill_tokens_per_second: Initial estimate for prefill cost.
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
+        if max_bytes is not None and (
+            isinstance(max_bytes, bool) or not isinstance(max_bytes, int)
+        ):
+            raise TypeError("max_bytes must be a non-negative integer or None")
+        if max_bytes is not None and max_bytes < 0:
+            raise ValueError("max_bytes must be a non-negative integer or None")
+        if cache_policy != "prefix_cost_aware_wtinylfu":
+            raise ValueError(
+                "cache_policy must be 'prefix_cost_aware_wtinylfu'"
+            )
+        self.max_bytes = max_bytes
+        self.cache_policy = cache_policy
         self.locality = Locality(locality) if locality is not None else None
 
         self.events: list[OffloadingEvent] | None = None
@@ -159,6 +193,9 @@ class FileSystemTierManager(SecondaryTierManager):
         # the GIL that read cannot observe the finished job without the prior
         # write, so no extra lock is needed (get_finished is itself lock-free).
         self._load_progress: dict[JobId, int] = {}
+        self._store_evictions: dict[JobId, list[OffloadKey]] = {}
+        self._load_paths: dict[JobId, list[str]] = {}
+        self._last_policy_age = time()
 
         # Extract block size from primary view
         assert primary_kv_view.strides is not None, (
@@ -173,7 +210,18 @@ class FileSystemTierManager(SecondaryTierManager):
             blocks_per_file=offloading_spec.blocks_per_chunk,
             parallel_agnostic=True,
         )
-
+        self._storage_dir = f"{self.file_mapper.base_path}_r{self.file_mapper.rank}"
+        self._capacity_lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_started = False
+        self._entries: dict[str, int] = {}
+        self._path_to_key: dict[str, OffloadKey] = {}
+        self._protected_load_paths: set[str] = set()
+        self._policy = PrefixCostAwareWTinyLFU(
+            recency_half_life_seconds=recency_half_life_seconds,
+            prefix_weight=prefix_weight,
+            prefill_tokens_per_second=prefill_tokens_per_second,
+        )
         # Write config file
         config_path = self.file_mapper.get_config_file_path()
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
@@ -182,6 +230,15 @@ class FileSystemTierManager(SecondaryTierManager):
                 json.dump(
                     self.file_mapper.get_run_config(), f, indent=2, sort_keys=True
                 )
+
+        self._metadata = CacheMetadataStore(
+            f"{self._storage_dir}.metadata.sqlite3"
+        )
+        self._policy.load(self._metadata.load())
+
+        with self._capacity_lock:
+            self._refresh_entries_locked()
+            self._flush_metadata_locked()
 
         # Prefer O_DIRECT to bypass the page cache, but fall back to buffered
         # I/O on filesystems that reject it (e.g. overlayfs, some NFS mounts)
@@ -212,20 +269,233 @@ class FileSystemTierManager(SecondaryTierManager):
         result = self._lookup_manager.lookup(key, req_context)
         if result is None:
             return LookupResult.RETRY
-        return LookupResult.HIT if result else LookupResult.MISS
+        self._policy.record_access(
+            key.hex(), session_id=req_context.req_id
+        )
+        if result:
+            self._touch_paths(
+                [self.file_mapper.get_file_name(key)], record_policy=False
+            )
+            return LookupResult.HIT
+        return LookupResult.MISS
+
+    def _parse_key(self, path: str) -> OffloadKey | None:
+        """Recover an offload key from a path in this tier's layout."""
+        try:
+            group_dir = os.path.basename(os.path.dirname(path))
+            hash_hex = os.path.basename(path)[:-4]
+            group_idx = int(group_dir.rsplit("_g", 1)[1])
+            return make_offload_key(bytes.fromhex(hash_hex), group_idx)
+        except (IndexError, ValueError):
+            return None
+
+    def _refresh_entries_locked(self) -> None:
+        """Reconcile files with policy metadata after restart or eviction."""
+        files: dict[str, tuple[OffloadKey, int]] = {}
+        if os.path.isdir(self._storage_dir):
+            for dirpath, _, filenames in os.walk(self._storage_dir):
+                for filename in filenames:
+                    if not filename.endswith(".bin"):
+                        continue
+                    path = os.path.join(dirpath, filename)
+                    try:
+                        stat = os.stat(path)
+                    except OSError:
+                        continue
+                    key = self._parse_key(path)
+                    if key is not None:
+                        files[path] = (key, stat.st_size)
+
+        current_keys = {key.hex() for key, _ in files.values()}
+        stale_keys = [
+            key for key in self._policy.entries if key not in current_keys
+        ]
+        for cache_key in stale_keys:
+            self._policy.on_remove(cache_key)
+        if stale_keys:
+            self._metadata.delete(stale_keys)
+
+        self._entries = {}
+        self._path_to_key = {}
+        for path, (key, size) in files.items():
+            cache_key = key.hex()
+            entry = self._policy.entries.get(cache_key)
+            if entry is None:
+                entry = self._policy.make_entry(
+                    cache_key=cache_key,
+                    path=path,
+                    size_bytes=size,
+                    token_count=self._token_count(key),
+                )
+                entry.created_at = entry.last_access_at = os.path.getmtime(path)
+                self._policy.on_store(entry, now=entry.last_access_at)
+            else:
+                entry.path = path
+                entry.size_bytes = size
+                entry.state = "READY"
+            self._entries[path] = size
+            self._path_to_key[path] = key
+
+    def _flush_metadata_locked(self) -> None:
+        """Batch-persist policy metadata; callers hold the capacity lock."""
+        self._metadata.save(self._policy.entries.values())
+
+    def _touch_paths(
+        self,
+        paths: Iterable[str],
+        session_id: str | None = None,
+        record_policy: bool = True,
+    ) -> None:
+        """Record access without using file timestamps as the policy."""
+        with self._capacity_lock:
+            for path in paths:
+                try:
+                    size = os.stat(path).st_size
+                except OSError:
+                    continue
+                self._entries[path] = size
+                key = self._path_to_key.get(path)
+                if key is not None and record_policy:
+                    self._policy.record_access(key.hex(), session_id=session_id)
+
+    def _remove_entry_locked(self, path: str) -> OffloadKey | None:
+        """Remove one block file and its bookkeeping, if it is removable."""
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            self._entries.pop(path, None)
+            key = self._path_to_key.pop(path, None)
+            if key is not None:
+                self._policy.on_remove(key.hex())
+            return key
+        except OSError:
+            return None
+        self._entries.pop(path, None)
+        key = self._path_to_key.pop(path, None)
+        if key is not None:
+            self._policy.on_remove(key.hex())
+        return key
+
+    def _token_count(self, key: OffloadKey) -> int:
+        """Return the token span represented by one persisted chunk."""
+        group_idx = get_offload_group_idx(key)
+        tokens_per_block = getattr(self._offloading_spec, "tokens_per_block", ())
+        if group_idx < len(tokens_per_block):
+            return int(tokens_per_block[group_idx]) * self._offloading_spec.blocks_per_chunk
+        return int(self._offloading_spec.tokens_per_hash) * self._offloading_spec.blocks_per_chunk
+
+    def _make_room_locked(
+        self, paths: list[str], session_id: str | None = None
+    ) -> tuple[bool, list[OffloadKey]]:
+        """Reserve space using frequency, prefix, cost and recency value."""
+        if self.max_bytes is None:
+            return True, []
+
+        self._refresh_entries_locked()
+        missing_paths = list(dict.fromkeys(p for p in paths if not os.path.exists(p)))
+        required_bytes = len(missing_paths) * self._block_size
+        if required_bytes > self.max_bytes:
+            return False, []
+
+        current_bytes = sum(self._entries.values())
+        if current_bytes + required_bytes <= self.max_bytes:
+            return True, []
+
+        protected = self._protected_load_paths | set(paths)
+        entries = [
+            self._policy.entries[key.hex()]
+            for path, key in self._path_to_key.items()
+            if path not in protected
+            and key.hex() in self._policy.entries
+            and self._policy.entries[key.hex()].state == "READY"
+        ]
+        bytes_to_free = current_bytes + required_bytes - self.max_bytes
+        victims = self._policy.select_victims(entries, bytes_to_free)
+        if sum(entry.size_bytes for entry in victims) < bytes_to_free:
+            return False, []
+
+        victim_candidates = list(victims)
+        for path in missing_paths:
+            key = self._path_to_key.get(path) or self._parse_key(path)
+            if key is None:
+                continue
+            candidate = self._policy.make_entry(
+                cache_key=key.hex(),
+                path=path,
+                size_bytes=self._block_size,
+                token_count=self._token_count(key),
+                session_id=session_id,
+            )
+            if not self._policy.should_admit(candidate, victim_candidates):
+                return False, []
+
+        evicted: list[OffloadKey] = []
+        for entry in victims:
+            key = self._remove_entry_locked(entry.path)
+            if key is not None:
+                evicted.append(key)
+        return True, evicted
+
+    def _store_batch(
+        self,
+        job_id: JobId,
+        paths: list[str],
+        offsets: list[int],
+        session_id: str | None,
+    ) -> None:
+        """Admit and write one batch while serializing capacity decisions."""
+        with self._capacity_lock:
+            admitted, evicted = self._make_room_locked(paths, session_id)
+            if self.events is not None:
+                self._store_evictions[job_id] = evicted
+            if not admitted:
+                logger.warning_once(
+                    "Skipping filesystem KV cache store for job %s: the batch "
+                    "does not fit in max_bytes=%d.",
+                    job_id,
+                    self.max_bytes,
+                )
+                return
+            try:
+                batch_store_block(
+                    paths,
+                    self._primary_kv_view,
+                    offsets,
+                    self._block_size,
+                    self._use_o_direct,
+                )
+                previous_key: str | None = None
+                for path in paths:
+                    key = self._parse_key(path)
+                    if key is None or not os.path.exists(path):
+                        continue
+                    entry = self._policy.make_entry(
+                        cache_key=key.hex(),
+                        path=path,
+                        size_bytes=os.path.getsize(path),
+                        token_count=self._token_count(key),
+                        parent_key=previous_key,
+                        session_id=session_id,
+                    )
+                    self._policy.on_store(entry)
+                    previous_key = key.hex()
+            finally:
+                self._refresh_entries_locked()
+                self._flush_metadata_locked()
 
     @override
     def submit_store(self, job_metadata: TransferJob) -> None:
         keys = list(job_metadata.keys)
         if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = keys
+        paths = [self.file_mapper.get_file_name(key) for key in keys]
+        offsets = [int(bid) * self._block_size for bid in job_metadata.block_ids]
         task = functools.partial(
-            batch_store_block,
-            [self.file_mapper.get_file_name(key) for key in keys],
-            self._primary_kv_view,
-            [int(bid) * self._block_size for bid in job_metadata.block_ids],
-            self._block_size,
-            self._use_o_direct,
+            self._store_batch,
+            job_metadata.job_id,
+            paths,
+            offsets,
+            job_metadata.req_context.req_id,
         )
         self._pool.enqueue_store(job_metadata.job_id, 1, [task])
 
@@ -237,6 +507,13 @@ class FileSystemTierManager(SecondaryTierManager):
         keys = list(job_metadata.keys)
         self._load_job_keys[job_id] = keys
         paths = [self.file_mapper.get_file_name(key) for key in keys]
+        self._load_paths[job_id] = paths
+        with self._capacity_lock:
+            self._protected_load_paths.update(paths)
+            for path in paths:
+                key = self._path_to_key.get(path)
+                if key is not None and key.hex() in self._policy.entries:
+                    self._policy.entries[key.hex()].state = "READING"
         offsets = [int(bid) * self._block_size for bid in job_metadata.block_ids]
 
         def load_task() -> None:
@@ -274,8 +551,47 @@ class FileSystemTierManager(SecondaryTierManager):
         as a miss here (scheduler thread)."""
         results = []
         for job_id, success, transfer_time in self._pool.get_finished():
+            with self._capacity_lock:
+                load_paths = self._load_paths.pop(job_id, [])
+                for path in load_paths:
+                    self._protected_load_paths.discard(path)
+                    key = self._path_to_key.get(path)
+                    if key is None:
+                        continue
+                    entry = self._policy.entries.get(key.hex())
+                    if entry is None:
+                        continue
+                    if os.path.exists(path):
+                        entry.state = "READY"
+                        if transfer_time is not None:
+                            sample_ms = transfer_time * 1000 / max(
+                                len(load_paths), 1
+                            )
+                            entry.observed_load_ms_ema = (
+                                0.2 * sample_ms
+                                + 0.8 * entry.observed_load_ms_ema
+                            )
+                    else:
+                        self._policy.on_remove(key.hex())
+                evicted_keys = self._store_evictions.pop(job_id, [])
+                self._flush_metadata_locked()
             if self.events is not None:
+                if evicted_keys:
+                    self.events.append(
+                        OffloadingEvent(
+                            keys=evicted_keys,
+                            medium=self.medium,
+                            removed=True,
+                            locality=self.locality,
+                        )
+                    )
                 keys = self._store_job_keys.pop(job_id, None)
+                if success and keys:
+                    keys = [
+                        key
+                        for key in keys
+                        if os.path.exists(self.file_mapper.get_file_name(key))
+                    ]
                 if success and keys:
                     self.events.append(
                         OffloadingEvent(
@@ -319,6 +635,23 @@ class FileSystemTierManager(SecondaryTierManager):
             yield from self.events
             self.events.clear()
 
+    @property
+    def disk_usage_bytes(self) -> int:
+        """Return the current block-data usage for this rank's cache."""
+        with self._capacity_lock:
+            self._refresh_entries_locked()
+            return sum(self._entries.values())
+
+    @override
+    def touch(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> None:
+        key_list = list(keys)
+        for key in key_list:
+            self._policy.record_access(key.hex(), session_id=req_context.req_id)
+        self._touch_paths(
+            (self.file_mapper.get_file_name(key) for key in key_list),
+            record_policy=False,
+        )
+
     @override
     def drain_jobs(self) -> None:
         """Block until all in-flight transfers in the threadpool finish."""
@@ -330,6 +663,12 @@ class FileSystemTierManager(SecondaryTierManager):
     @override
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
         self._lookup_manager.flush()
+        now = time()
+        with self._capacity_lock:
+            if now - self._last_policy_age >= 60.0:
+                self._policy.age(now)
+                self._last_policy_age = now
+            self._flush_metadata_locked()
 
     @override
     def shutdown(self) -> None:
@@ -339,5 +678,16 @@ class FileSystemTierManager(SecondaryTierManager):
         Shuts down the lookup manager and the thread pool,
         clearing pending tasks and waiting for active threads to complete.
         """
+        with self._shutdown_lock:
+            if self._shutdown_started:
+                return
+            self._shutdown_started = True
+
         self._lookup_manager.shutdown()
         self._pool.shutdown(wait=True)
+        with self._capacity_lock:
+            self._protected_load_paths.clear()
+            self._load_paths.clear()
+            self._store_evictions.clear()
+            self._flush_metadata_locked()
+        self._metadata.close()

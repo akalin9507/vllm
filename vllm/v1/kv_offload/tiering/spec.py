@@ -24,8 +24,12 @@ Configuration via kv_connector_extra_config:
       - module_path: (optional) Python import path to load 'type' from
         when it names an out-of-tree SecondaryTierManager not registered
         via SecondaryTierFactory.register_tier()
-      - Additional tier-specific parameters are passed directly to the tier
-        constructor. See each tier's documentation for supported parameters.
+         - Additional tier-specific parameters are passed directly to the tier
+           constructor. See each tier's documentation for supported parameters.
+
+   The built-in filesystem tier accepts ``max_bytes`` to bound block data on
+   disk. Its default policy combines TinyLFU admission with prefix-cost-aware
+   Window/Probation/Protected eviction.
 
 Example configuration:
 {

@@ -40,6 +40,12 @@ from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 from vllm.v1.kv_offload.tiering.fs.manager import (
     FileSystemTierManager,
 )
+from vllm.v1.kv_offload.tiering.fs.policy import (
+    CacheEntry,
+    CacheMetadataStore,
+    FrequencySketch,
+    PrefixCostAwareWTinyLFU,
+)
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
 # ---------------------------------------------------------------------------
@@ -49,6 +55,7 @@ from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 _NUM_BLOCKS = 8
 _BLOCK_ELEMENTS = 128 * mmap.PAGESIZE  # 2MB per block for pagesize 4096.
 _DTYPE: torch.dtype = torch.float32
+_BLOCK_BYTES = _BLOCK_ELEMENTS * torch.tensor([], dtype=_DTYPE).element_size()
 _CTX = ReqContext(req_id="test")
 
 
@@ -296,6 +303,7 @@ def test_factory_forwards_locality_to_fs_tier(tmp_path):
             "n_read_threads": 1,
             "n_write_threads": 1,
             "locality": "LOCAL",
+            "max_bytes": 2 * _BLOCK_BYTES,
         },
         memoryview(tensor.numpy()),
         _MOCK_OFFLOADING_SPEC,
@@ -303,6 +311,183 @@ def test_factory_forwards_locality_to_fs_tier(tmp_path):
     try:
         assert isinstance(tier, FileSystemTierManager)
         assert tier.locality is Locality.LOCAL
+        assert tier.max_bytes == 2 * _BLOCK_BYTES
+        assert tier.cache_policy == "prefix_cost_aware_wtinylfu"
+    finally:
+        tier.shutdown()
+
+
+def test_fs_tier_evicts_low_value_unprotected_block(tmp_path):
+    """A bounded tier evicts by policy value rather than timestamp alone."""
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    tier = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+        max_bytes=2 * _BLOCK_BYTES,
+    )
+    try:
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        tier.submit_store(make_job(2, [key(2)], [1]))
+        assert all(result.success for result in drain(tier))
+
+        tier.touch([key(1)], _CTX)
+        tier.touch([key(3)], _CTX)
+        tier.touch([key(3)], _CTX)
+        tier.submit_store(make_job(3, [key(3)], [2]))
+        assert all(result.success for result in drain(tier))
+
+        assert os.path.exists(tier.file_mapper.get_file_name(key(1)))
+        assert not os.path.exists(tier.file_mapper.get_file_name(key(2)))
+        assert os.path.exists(tier.file_mapper.get_file_name(key(3)))
+        assert tier.disk_usage_bytes <= tier.max_bytes
+    finally:
+        tier.shutdown()
+
+
+def test_fs_tier_rehydrates_policy_metadata_after_restart(tmp_path):
+    """A new manager restores policy metadata before subsequent eviction."""
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    max_bytes = 2 * _BLOCK_BYTES
+    first = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+        max_bytes=max_bytes,
+    )
+    first.submit_store(make_job(1, [key(1), key(2)], [0, 1]))
+    assert all(result.success for result in drain(first))
+    first.touch([key(1)], _CTX)
+    first.shutdown()
+
+    second = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+        max_bytes=max_bytes,
+    )
+    try:
+        second.touch([key(3)], _CTX)
+        second.touch([key(3)], _CTX)
+        second.submit_store(make_job(2, [key(3)], [2]))
+        assert all(result.success for result in drain(second))
+        assert os.path.exists(second.file_mapper.get_file_name(key(1)))
+        assert not os.path.exists(second.file_mapper.get_file_name(key(2)))
+        assert os.path.exists(second.file_mapper.get_file_name(key(3)))
+        assert second.disk_usage_bytes <= max_bytes
+    finally:
+        second.shutdown()
+
+
+def test_frequency_sketch_counts_and_ages():
+    sketch = FrequencySketch(width=32, depth=3)
+    sketch.increment("hot")
+    sketch.increment("hot")
+    sketch.increment("cold")
+    assert sketch.estimate("hot") == 2
+    assert sketch.estimate("cold") == 1
+    sketch.age()
+    assert sketch.estimate("hot") == 1
+
+
+def test_policy_rejects_one_hit_candidate_against_equal_frequency():
+    policy = PrefixCostAwareWTinyLFU()
+    now = 100.0
+    victim = CacheEntry(
+        cache_key="victim",
+        path="victim",
+        size_bytes=100,
+        token_count=100,
+        created_at=now,
+        last_access_at=now,
+        decayed_frequency=1.0,
+    )
+    policy.on_store(victim, now=now)
+    policy.record_access("victim", now=now, session_id="s1")
+    candidate = policy.make_entry("candidate", "candidate", 100, 100)
+    policy.sketch.increment("candidate")
+    assert not policy.should_admit(candidate, [victim])
+
+
+def test_policy_retains_shared_high_cost_prefix():
+    policy = PrefixCostAwareWTinyLFU()
+    shared = CacheEntry(
+        cache_key="shared",
+        path="shared",
+        size_bytes=100,
+        token_count=1000,
+        created_at=1.0,
+        last_access_at=1.0,
+        estimated_prefill_ms=1000.0,
+        distinct_session_count=4,
+        child_count=2,
+        depth=0,
+    )
+    suffix = CacheEntry(
+        cache_key="suffix",
+        path="suffix",
+        size_bytes=100,
+        token_count=100,
+        created_at=1.0,
+        last_access_at=1.0,
+        estimated_prefill_ms=100.0,
+        depth=5,
+    )
+    policy.on_store(shared, now=1.0)
+    policy.on_store(suffix, now=1.0)
+    victims = policy.select_victims([shared, suffix], 100, now=2.0)
+    assert [entry.cache_key for entry in victims] == ["suffix"]
+
+
+def test_policy_metadata_survives_restart(tmp_path):
+    metadata = CacheMetadataStore(str(tmp_path / "entries.sqlite3"))
+    entry = CacheEntry(
+        cache_key="persisted",
+        path="persisted.bin",
+        size_bytes=123,
+        token_count=16,
+        created_at=1.0,
+        last_access_at=2.0,
+        access_count=3,
+        decayed_frequency=2.5,
+        segment=PrefixCostAwareWTinyLFU.PROTECTED,
+    )
+    metadata.save([entry])
+    metadata.close()
+    restored = CacheMetadataStore(str(tmp_path / "entries.sqlite3"))
+    try:
+        assert restored.load() == [entry]
+    finally:
+        restored.close()
+
+
+def test_fs_tier_skips_batch_larger_than_capacity_without_error(tmp_path):
+    """An undersized cache does not make an offload job fail or grow on disk."""
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    tier = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+        max_bytes=_BLOCK_BYTES - 1,
+    )
+    try:
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        results = drain(tier)
+        assert len(results) == 1 and results[0].success
+        assert not os.path.exists(tier.file_mapper.get_file_name(key(1)))
+        assert tier.disk_usage_bytes == 0
     finally:
         tier.shutdown()
 

@@ -54,6 +54,8 @@ vllm serve <model> \
         {
           "type": "fs",
           "root_dir": "/mnt/kv_cache",
+          "max_bytes": 375809638400,
+          "cache_policy": "prefix_cost_aware_wtinylfu",
           "n_read_threads": 32,
           "n_write_threads": 16
         }
@@ -127,6 +129,8 @@ The filesystem tier (`type: "fs"`) writes blocks to a filesystem directory.
 | `root_dir` | yes | — | Base directory; vLLM creates subdirectories beneath it (see [On-Disk Layout](#on-disk-layout)). |
 | `n_read_threads` | no | `16` | Read-priority I/O threads (load path). |
 | `n_write_threads` | no | `16` | Write-priority I/O threads (store path). |
+| `max_bytes` | no | unlimited | Maximum block-data bytes for this rank's disk cache. The default optimized policy selects victims by frequency, prefix sharing, estimated Prefill savings, load cost, segment, and recency. `config.json` and temporary files are excluded. A batch larger than the limit is skipped without failing inference. |
+| `cache_policy` | no | `prefix_cost_aware_wtinylfu` | Disk-tier admission and eviction policy. The optimized policy combines Count-Min Sketch admission with Window/Probation/Protected segments and prefix-cost-aware scoring. |
 | `enable_kv_events` | no | `false` | Publish `BlockStored` KV events (medium `FS`) for successfully stored blocks. Requires KV cache events to be enabled globally. |
 | `locality` | no | unspecified | `LOCAL` or `REMOTE` relative to the publishing vLLM instance. Included in the tier's KV events only when explicitly configured. |
 
@@ -149,6 +153,21 @@ Inside that subdirectory, blocks are sharded across hash-prefix subdirectories t
 ```
 
 `config.json` records the run (block size, number of KV groups, etc.) and is written on first start. Each rank writes blocks under its own `_r<rank>` sibling directory, so multiple ranks can safely share the same `root_dir`.
+
+When `max_bytes` is set, the limit applies to the `.bin` block files under the
+current rank's directory. Policy metadata is persisted in a WAL-mode SQLite
+database and restored after restart. Blocks in `READING`, `WRITING`, or
+`EVICTING` state are protected; if a store batch cannot fit or loses the
+frequency admission comparison, it is skipped as a cache miss rather than
+surfacing an inference error.
+
+The default `prefix_cost_aware_wtinylfu` policy maintains a Count-Min Sketch
+for frequency admission and three segments: `WINDOW`, `PROBATION`, and
+`PROTECTED`. Victim scores combine decayed frequency, recency, shared-prefix
+and child counts, prefix depth, estimated Prefill cost, and observed disk-load
+cost; lower score means earlier eviction. The policy is independent of the
+filesystem I/O manager, so its parameters can be tuned without changing the
+vLLM scheduler.
 
 #### Cross-Process Sharing
 
