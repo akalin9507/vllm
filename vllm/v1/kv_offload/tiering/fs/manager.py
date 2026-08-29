@@ -20,8 +20,8 @@ import json
 import os
 import threading
 from collections.abc import Iterable
-from time import time
-from typing import TYPE_CHECKING, ClassVar
+from time import monotonic, time
+from typing import TYPE_CHECKING, Any, ClassVar
 
 try:
     from vllm.fs_io_C import batch_lookup as batch_lookup_C
@@ -32,12 +32,18 @@ except ImportError:
 
 from typing_extensions import override
 
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+)
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     Locality,
     LookupResult,
     Medium,
+    OffloadingCounterMetadata,
     OffloadingEvent,
+    OffloadingGaugeMetadata,
+    OffloadingMetricMetadata,
     OffloadKey,
     ReqContext,
     make_offload_key,
@@ -116,6 +122,52 @@ class FileSystemTierManager(SecondaryTierManager):
 
     medium: ClassVar[Medium] = Medium.STORAGE
 
+    CACHE_BYTES = "vllm:kv_offload_fs_cache_bytes"
+    CACHE_ENTRIES = "vllm:kv_offload_fs_cache_entries"
+    ADMISSION_ATTEMPTS = "vllm:kv_offload_fs_admission_attempts"
+    ADMITTED_BLOCKS = "vllm:kv_offload_fs_admitted_blocks"
+    REJECTED_BLOCKS = "vllm:kv_offload_fs_rejected_blocks"
+    PARTIAL_ADMISSION_BATCHES = "vllm:kv_offload_fs_partial_admission_batches"
+    SKIPPED_BATCHES = "vllm:kv_offload_fs_skipped_batches"
+    EVICTIONS = "vllm:kv_offload_fs_evictions"
+    EVICTED_BYTES = "vllm:kv_offload_fs_evicted_bytes"
+    ADMISSION_REJECTIONS = "vllm:kv_offload_fs_admission_rejections"
+
+    @classmethod
+    def build_metric_definitions(
+        cls, extra_config: dict[str, Any]
+    ) -> dict[str, OffloadingMetricMetadata]:
+        """Return capacity, admission, and eviction metric definitions."""
+        del extra_config
+        counter_docs = {
+            cls.ADMISSION_ATTEMPTS: "Filesystem cache admission attempts.",
+            cls.ADMITTED_BLOCKS: "Blocks admitted to the filesystem cache.",
+            cls.REJECTED_BLOCKS: "Blocks rejected by filesystem cache admission.",
+            cls.PARTIAL_ADMISSION_BATCHES: (
+                "Store batches admitted only partially to the filesystem cache."
+            ),
+            cls.SKIPPED_BATCHES: (
+                "Store batches skipped because no block was admitted."
+            ),
+            cls.EVICTIONS: "Blocks evicted from the filesystem cache.",
+            cls.EVICTED_BYTES: "Bytes evicted from the filesystem cache.",
+        }
+        definitions: dict[str, OffloadingMetricMetadata] = {
+            name: OffloadingCounterMetadata(documentation=documentation)
+            for name, documentation in counter_docs.items()
+        }
+        definitions[cls.CACHE_BYTES] = OffloadingGaugeMetadata(
+            documentation="Current filesystem KV cache block-data bytes."
+        )
+        definitions[cls.CACHE_ENTRIES] = OffloadingGaugeMetadata(
+            documentation="Current filesystem KV cache block entry count."
+        )
+        definitions[cls.ADMISSION_REJECTIONS] = OffloadingCounterMetadata(
+            documentation="Filesystem cache admission rejections by reason.",
+            labelnames=("reason",),
+        )
+        return definitions
+
     def __init__(
         self,
         offloading_spec: "OffloadingSpec",
@@ -131,6 +183,11 @@ class FileSystemTierManager(SecondaryTierManager):
         recency_half_life_seconds: float = 3600.0,
         prefix_weight: float = 1.0,
         prefill_tokens_per_second: float = 1000.0,
+        frequency_sketch_half_life_seconds: float = 3600.0,
+        window_ratio: float = 0.05,
+        probation_ratio: float = 0.20,
+        protected_ratio: float = 0.75,
+        cache_namespace: str | None = None,
     ):
         """
         Args:
@@ -154,6 +211,7 @@ class FileSystemTierManager(SecondaryTierManager):
                 and frequency decay.
             prefix_weight: Weight for shallow/shared prefix entries.
             prefill_tokens_per_second: Initial estimate for prefill cost.
+            cache_namespace: Optional relative partition below ``root_dir``.
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
         if max_bytes is not None and (
@@ -209,6 +267,7 @@ class FileSystemTierManager(SecondaryTierManager):
             offloading_spec=offloading_spec,
             blocks_per_file=offloading_spec.blocks_per_chunk,
             parallel_agnostic=True,
+            cache_namespace=cache_namespace,
         )
         self._storage_dir = f"{self.file_mapper.base_path}_r{self.file_mapper.rank}"
         self._capacity_lock = threading.Lock()
@@ -217,10 +276,18 @@ class FileSystemTierManager(SecondaryTierManager):
         self._entries: dict[str, int] = {}
         self._path_to_key: dict[str, OffloadKey] = {}
         self._protected_load_paths: set[str] = set()
+        self._request_group_tails: dict[tuple[str, int], str] = {}
+        self._stats = OffloadingConnectorStats()
         self._policy = PrefixCostAwareWTinyLFU(
             recency_half_life_seconds=recency_half_life_seconds,
             prefix_weight=prefix_weight,
             prefill_tokens_per_second=prefill_tokens_per_second,
+            frequency_sketch_half_life_seconds=(
+                frequency_sketch_half_life_seconds
+            ),
+            window_ratio=window_ratio,
+            probation_ratio=probation_ratio,
+            protected_ratio=protected_ratio,
         )
         # Write config file
         config_path = self.file_mapper.get_config_file_path()
@@ -258,7 +325,9 @@ class FileSystemTierManager(SecondaryTierManager):
             thread_name_prefix="vllm_kv_py_fs",
         )
 
-        self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
+        self._lookup_manager = FsAsyncLookupManager(
+            tier=self, tier_type=self.tier_type
+        )
 
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
@@ -269,9 +338,12 @@ class FileSystemTierManager(SecondaryTierManager):
         result = self._lookup_manager.lookup(key, req_context)
         if result is None:
             return LookupResult.RETRY
-        self._policy.record_access(
-            key.hex(), session_id=req_context.req_id
-        )
+        with self._capacity_lock:
+            self._policy.record_access(key.hex(), session_id=req_context.req_id)
+            if result:
+                self._request_group_tails[
+                    (req_context.req_id, get_offload_group_idx(key))
+                ] = key.hex()
         if result:
             self._touch_paths(
                 [self.file_mapper.get_file_name(key)], record_policy=False
@@ -332,9 +404,61 @@ class FileSystemTierManager(SecondaryTierManager):
             else:
                 entry.path = path
                 entry.size_bytes = size
-                entry.state = "READY"
+                entry.state = (
+                    "READING" if path in self._protected_load_paths else "READY"
+                )
             self._entries[path] = size
             self._path_to_key[path] = key
+        self._reconcile_parent_links_locked()
+
+    def _reconcile_parent_links_locked(self) -> None:
+        """Rebuild parent links and child counts from authoritative entries."""
+        entries = self._policy.entries
+        states: dict[str, int] = {}
+
+        def normalize(cache_key: str) -> None:
+            state = states.get(cache_key, 0)
+            entry = entries[cache_key]
+            if state == 2:
+                return
+            if state == 1:
+                entry.parent_key = None
+                entry.depth = 0
+                entry.token_start = 0
+                entry.token_end = entry.token_count
+                states[cache_key] = 2
+                return
+
+            states[cache_key] = 1
+            parent_key = entry.parent_key
+            if parent_key is None or parent_key not in entries:
+                entry.parent_key = None
+                entry.depth = 0
+                entry.token_start = 0
+                entry.token_end = entry.token_count
+            else:
+                normalize(parent_key)
+                parent = entries.get(parent_key)
+                if parent is None:
+                    entry.parent_key = None
+                    entry.depth = 0
+                    entry.token_start = 0
+                    entry.token_end = entry.token_count
+                else:
+                    entry.depth = parent.depth + 1
+                    entry.token_start = parent.token_end
+                    entry.token_end = entry.token_start + entry.token_count
+            states[cache_key] = 2
+
+        for cache_key in entries:
+            normalize(cache_key)
+        for entry in entries.values():
+            entry.child_count = 0
+        for entry in entries.values():
+            if entry.parent_key is not None:
+                parent = entries.get(entry.parent_key)
+                if parent is not None:
+                    parent.child_count += 1
 
     def _flush_metadata_locked(self) -> None:
         """Batch-persist policy metadata; callers hold the capacity lock."""
@@ -367,6 +491,8 @@ class FileSystemTierManager(SecondaryTierManager):
             key = self._path_to_key.pop(path, None)
             if key is not None:
                 self._policy.on_remove(key.hex())
+                self._metadata.delete((key.hex(),))
+                self._drop_request_tails_locked(key.hex())
             return key
         except OSError:
             return None
@@ -374,67 +500,165 @@ class FileSystemTierManager(SecondaryTierManager):
         key = self._path_to_key.pop(path, None)
         if key is not None:
             self._policy.on_remove(key.hex())
+            self._metadata.delete((key.hex(),))
+            self._drop_request_tails_locked(key.hex())
         return key
+
+    def _drop_request_tails_locked(self, cache_key: str) -> None:
+        stale_tails = [
+            tail for tail, value in self._request_group_tails.items()
+            if value == cache_key
+        ]
+        for tail in stale_tails:
+            del self._request_group_tails[tail]
+
+    def _increase_counter(
+        self,
+        name: str,
+        value: int | float = 1,
+        labelvalues: tuple[str, ...] = (),
+    ) -> None:
+        self._stats.increase_counter(name, value, labelvalues)
+
+    def _record_admission_rejection(self, reason: str) -> None:
+        self._increase_counter(
+            self.ADMISSION_REJECTIONS,
+            labelvalues=(reason,),
+        )
 
     def _token_count(self, key: OffloadKey) -> int:
         """Return the token span represented by one persisted chunk."""
         group_idx = get_offload_group_idx(key)
         tokens_per_block = getattr(self._offloading_spec, "tokens_per_block", ())
         if group_idx < len(tokens_per_block):
-            return int(tokens_per_block[group_idx]) * self._offloading_spec.blocks_per_chunk
-        return int(self._offloading_spec.tokens_per_hash) * self._offloading_spec.blocks_per_chunk
+            return (
+                int(tokens_per_block[group_idx])
+                * self._offloading_spec.blocks_per_chunk
+            )
+        return (
+            int(self._offloading_spec.tokens_per_hash)
+            * self._offloading_spec.blocks_per_chunk
+        )
 
     def _make_room_locked(
         self, paths: list[str], session_id: str | None = None
-    ) -> tuple[bool, list[OffloadKey]]:
-        """Reserve space using frequency, prefix, cost and recency value."""
+    ) -> tuple[list[str], list[OffloadKey]]:
+        """Admit as many blocks as fit while preserving prefix chains."""
+        unique_paths = list(dict.fromkeys(paths))
+        existing_paths = [path for path in unique_paths if os.path.exists(path)]
+        missing_paths = [
+            path for path in unique_paths if not os.path.exists(path)
+        ]
+        self._increase_counter(self.ADMISSION_ATTEMPTS, len(missing_paths))
         if self.max_bytes is None:
-            return True, []
+            self._increase_counter(self.ADMITTED_BLOCKS, len(missing_paths))
+            return unique_paths, []
 
         self._refresh_entries_locked()
-        missing_paths = list(dict.fromkeys(p for p in paths if not os.path.exists(p)))
-        required_bytes = len(missing_paths) * self._block_size
-        if required_bytes > self.max_bytes:
-            return False, []
-
         current_bytes = sum(self._entries.values())
-        if current_bytes + required_bytes <= self.max_bytes:
-            return True, []
+        protected = self._protected_load_paths | set(unique_paths)
+        group_tails = {
+            group: tail
+            for (request_id, group), tail in self._request_group_tails.items()
+            if request_id == session_id
+        }
+        admitted_missing: list[str] = []
+        blocked_groups: set[int] = set()
 
-        protected = self._protected_load_paths | set(paths)
-        entries = [
-            self._policy.entries[key.hex()]
-            for path, key in self._path_to_key.items()
-            if path not in protected
-            and key.hex() in self._policy.entries
-            and self._policy.entries[key.hex()].state == "READY"
-        ]
-        bytes_to_free = current_bytes + required_bytes - self.max_bytes
-        victims = self._policy.select_victims(entries, bytes_to_free)
-        if sum(entry.size_bytes for entry in victims) < bytes_to_free:
-            return False, []
+        def select_victims(required_blocks: int) -> list[CacheEntry]:
+            bytes_to_free = max(
+                current_bytes
+                + required_blocks * self._block_size
+                - self.max_bytes,
+                0,
+            )
+            if bytes_to_free == 0:
+                return []
+            candidates = [
+                self._policy.entries[key.hex()]
+                for path, key in self._path_to_key.items()
+                if path not in protected
+                and key.hex() in self._policy.entries
+                and self._policy.entries[key.hex()].state == "READY"
+            ]
+            return self._policy.select_victims(candidates, bytes_to_free)
 
-        victim_candidates = list(victims)
         for path in missing_paths:
-            key = self._path_to_key.get(path) or self._parse_key(path)
+            key = self._parse_key(path)
             if key is None:
+                self._record_admission_rejection("invalid_key")
                 continue
+            group_idx = get_offload_group_idx(key)
+            if group_idx in blocked_groups:
+                self._record_admission_rejection("prefix_chain")
+                continue
+            parent_key = group_tails.get(group_idx)
             candidate = self._policy.make_entry(
                 cache_key=key.hex(),
                 path=path,
                 size_bytes=self._block_size,
                 token_count=self._token_count(key),
+                parent_key=parent_key,
                 session_id=session_id,
             )
-            if not self._policy.should_admit(candidate, victim_candidates):
-                return False, []
+            victims = select_victims(len(admitted_missing) + 1)
+            required_bytes = max(
+                current_bytes
+                + (len(admitted_missing) + 1) * self._block_size
+                - self.max_bytes,
+                0,
+            )
+            if required_bytes > 0 and sum(
+                victim.size_bytes for victim in victims
+            ) < required_bytes:
+                blocked_groups.add(group_idx)
+                self._record_admission_rejection("capacity")
+                continue
+            if required_bytes > 0 and not self._policy.should_admit(
+                candidate, victims
+            ):
+                blocked_groups.add(group_idx)
+                self._record_admission_rejection("policy")
+                continue
+            admitted_missing.append(path)
+            group_tails[group_idx] = key.hex()
+
+        accepted_paths = existing_paths + admitted_missing
+        if admitted_missing:
+            self._increase_counter(self.ADMITTED_BLOCKS, len(admitted_missing))
+        rejected_count = len(missing_paths) - len(admitted_missing)
+        if rejected_count:
+            self._increase_counter(self.REJECTED_BLOCKS, rejected_count)
+        if admitted_missing and rejected_count:
+            self._increase_counter(self.PARTIAL_ADMISSION_BATCHES)
+        elif missing_paths and not admitted_missing:
+            self._increase_counter(self.SKIPPED_BATCHES)
+
+        final_victims = select_victims(len(admitted_missing))
+        required_bytes = max(
+            current_bytes
+            + len(admitted_missing) * self._block_size
+            - self.max_bytes,
+            0,
+        )
+        if required_bytes > 0 and sum(
+            victim.size_bytes for victim in final_victims
+        ) < required_bytes:
+            accepted_paths = existing_paths
+            admitted_missing.clear()
+            final_victims = []
 
         evicted: list[OffloadKey] = []
-        for entry in victims:
+        evicted_bytes = 0
+        for entry in final_victims:
             key = self._remove_entry_locked(entry.path)
             if key is not None:
                 evicted.append(key)
-        return True, evicted
+                evicted_bytes += entry.size_bytes
+        if evicted:
+            self._increase_counter(self.EVICTIONS, len(evicted))
+            self._increase_counter(self.EVICTED_BYTES, evicted_bytes)
+        return accepted_paths, evicted
 
     def _store_batch(
         self,
@@ -445,42 +669,65 @@ class FileSystemTierManager(SecondaryTierManager):
     ) -> None:
         """Admit and write one batch while serializing capacity decisions."""
         with self._capacity_lock:
-            admitted, evicted = self._make_room_locked(paths, session_id)
+            admitted_paths, evicted = self._make_room_locked(paths, session_id)
             if self.events is not None:
                 self._store_evictions[job_id] = evicted
-            if not admitted:
-                logger.warning_once(
-                    "Skipping filesystem KV cache store for job %s: the batch "
-                    "does not fit in max_bytes=%d.",
-                    job_id,
-                    self.max_bytes,
-                )
+            admitted_set = set(admitted_paths)
+            seen_paths: set[str] = set()
+            batch_paths: list[str] = []
+            batch_offsets: list[int] = []
+            for path, offset in zip(paths, offsets):
+                if path in admitted_set and path not in seen_paths:
+                    batch_paths.append(path)
+                    batch_offsets.append(offset)
+                    seen_paths.add(path)
+            if not batch_paths:
                 return
+            started_at = monotonic()
             try:
                 batch_store_block(
-                    paths,
+                    batch_paths,
                     self._primary_kv_view,
-                    offsets,
+                    batch_offsets,
                     self._block_size,
                     self._use_o_direct,
                 )
-                previous_key: str | None = None
-                for path in paths:
+                store_ms = max((monotonic() - started_at) * 1000.0, 0.001)
+                per_entry_store_ms = store_ms / max(len(batch_paths), 1)
+                for path in batch_paths:
                     key = self._parse_key(path)
                     if key is None or not os.path.exists(path):
                         continue
+                    group_idx = get_offload_group_idx(key)
+                    tail_key = None
+                    if session_id is not None:
+                        tail_key = self._request_group_tails.get(
+                            (session_id, group_idx)
+                        )
                     entry = self._policy.make_entry(
                         cache_key=key.hex(),
                         path=path,
                         size_bytes=os.path.getsize(path),
                         token_count=self._token_count(key),
-                        parent_key=previous_key,
+                        parent_key=tail_key,
                         session_id=session_id,
                     )
+                    previous = self._policy.entries.get(key.hex())
+                    previous_store_ms = (
+                        0.0 if previous is None else previous.observed_store_ms_ema
+                    )
+                    entry.observed_store_ms_ema = (
+                        per_entry_store_ms
+                        if previous_store_ms <= 0
+                        else 0.8 * previous_store_ms + 0.2 * per_entry_store_ms
+                    )
                     self._policy.on_store(entry)
-                    previous_key = key.hex()
+                    if session_id is not None:
+                        self._request_group_tails[(session_id, group_idx)] = key.hex()
+                    self._entries[path] = entry.size_bytes
+                    self._path_to_key[path] = key
             finally:
-                self._refresh_entries_locked()
+                self._reconcile_parent_links_locked()
                 self._flush_metadata_locked()
 
     @override
@@ -573,6 +820,7 @@ class FileSystemTierManager(SecondaryTierManager):
                             )
                     else:
                         self._policy.on_remove(key.hex())
+                self._reconcile_parent_links_locked()
                 evicted_keys = self._store_evictions.pop(job_id, [])
                 self._flush_metadata_locked()
             if self.events is not None:
@@ -643,10 +891,27 @@ class FileSystemTierManager(SecondaryTierManager):
             return sum(self._entries.values())
 
     @override
+    def get_stats(self) -> OffloadingConnectorStats | None:
+        """Return filesystem capacity and policy observations since last call."""
+        with self._capacity_lock:
+            self._refresh_entries_locked()
+            self._stats.set_gauge(self.CACHE_BYTES, sum(self._entries.values()))
+            self._stats.set_gauge(self.CACHE_ENTRIES, len(self._entries))
+            if self._stats.is_empty():
+                return None
+            stats = self._stats
+            self._stats = OffloadingConnectorStats()
+            return stats
+
+    @override
     def touch(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> None:
         key_list = list(keys)
-        for key in key_list:
-            self._policy.record_access(key.hex(), session_id=req_context.req_id)
+        with self._capacity_lock:
+            for key in key_list:
+                self._policy.record_access(key.hex(), session_id=req_context.req_id)
+                self._request_group_tails[
+                    (req_context.req_id, get_offload_group_idx(key))
+                ] = key.hex()
         self._touch_paths(
             (self.file_mapper.get_file_name(key) for key in key_list),
             record_policy=False,
@@ -659,6 +924,14 @@ class FileSystemTierManager(SecondaryTierManager):
 
     def on_request_finished(self, req_context: ReqContext) -> None:
         self._lookup_manager.cleanup(req_context.req_id)
+        with self._capacity_lock:
+            stale_tails = [
+                key
+                for key in self._request_group_tails
+                if key[0] == req_context.req_id
+            ]
+            for key in stale_tails:
+                del self._request_group_tails[key]
 
     @override
     def on_schedule_end(self, context: ScheduleEndContext) -> None:

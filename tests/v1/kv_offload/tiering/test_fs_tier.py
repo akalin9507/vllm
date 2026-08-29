@@ -399,6 +399,37 @@ def test_frequency_sketch_counts_and_ages():
     assert sketch.estimate("hot") == 1
 
 
+def test_policy_score_is_pure_and_frequency_decay_is_not_compounded():
+    policy = PrefixCostAwareWTinyLFU(recency_half_life_seconds=10.0)
+    entry = CacheEntry(
+        cache_key="stable",
+        path="stable",
+        size_bytes=100,
+        last_access_at=10.0,
+        decayed_frequency=8.0,
+        estimated_prefill_ms=100.0,
+    )
+    policy.entries[entry.cache_key] = entry
+    before = entry.decayed_frequency
+    assert policy.score(entry, now=20.0) == policy.score(entry, now=20.0)
+    assert entry.decayed_frequency == before
+    policy.record_access("stable", now=20.0)
+    assert entry.decayed_frequency == 5.0
+
+
+def test_policy_sketch_ages_only_after_configured_half_life():
+    policy = PrefixCostAwareWTinyLFU(
+        frequency_sketch_half_life_seconds=10.0
+    )
+    policy._last_sketch_age = 100.0
+    policy.sketch.increment("hot")
+    policy.sketch.increment("hot")
+    policy.age(now=105.0)
+    assert policy.sketch.estimate("hot") == 2
+    policy.age(now=110.0)
+    assert policy.sketch.estimate("hot") == 1
+
+
 def test_policy_rejects_one_hit_candidate_against_equal_frequency():
     policy = PrefixCostAwareWTinyLFU()
     now = 100.0
@@ -446,6 +477,147 @@ def test_policy_retains_shared_high_cost_prefix():
     policy.on_store(suffix, now=1.0)
     victims = policy.select_victims([shared, suffix], 100, now=2.0)
     assert [entry.cache_key for entry in victims] == ["suffix"]
+
+
+def test_removing_parent_detaches_children():
+    policy = PrefixCostAwareWTinyLFU()
+    parent = policy.make_entry("parent", "parent", 100, 16)
+    child = policy.make_entry("child", "child", 100, 16, parent_key="parent")
+    policy.on_store(parent)
+    policy.on_store(child)
+    policy.on_remove("parent")
+    assert child.parent_key is None
+    assert (child.depth, child.token_start, child.token_end) == (0, 0, 16)
+
+
+def test_eviction_deletes_metadata_without_restart(tmp_path):
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    tier = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+        max_bytes=_BLOCK_BYTES,
+    )
+    try:
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        assert all(result.success for result in drain(tier))
+        tier.touch([key(2)], _CTX)
+        tier.touch([key(2)], _CTX)
+        tier.submit_store(make_job(2, [key(2)], [1]))
+        assert all(result.success for result in drain(tier))
+        assert len(tier._metadata.load()) == 1
+        assert len(tier._entries) == 1
+    finally:
+        tier.shutdown()
+
+
+def test_fs_tier_partially_admits_store_batch(tmp_path):
+    """A full tier keeps valuable blocks and admits a fitting batch prefix."""
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    tier = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+        max_bytes=2 * _BLOCK_BYTES,
+    )
+    try:
+        tier.submit_store(make_job(1, [key(1), key(2)], [0, 1]))
+        assert all(result.success for result in drain(tier))
+        tier.touch([key(1)], _CTX)
+        tier.touch([key(1)], _CTX)
+        tier._policy.sketch.increment(key(3).hex())
+        tier._policy.sketch.increment(key(3).hex())
+
+        tier.submit_store(make_job(2, [key(3), key(4)], [2, 3]))
+        assert all(result.success for result in drain(tier))
+
+        assert os.path.exists(tier.file_mapper.get_file_name(key(3)))
+        assert not os.path.exists(tier.file_mapper.get_file_name(key(4)))
+        assert tier.disk_usage_bytes <= tier.max_bytes
+        stats = tier.get_stats()
+        assert stats is not None
+        values = stats.data["data"]
+        assert values[tier.PARTIAL_ADMISSION_BATCHES][()] == 1
+        assert values[tier.REJECTED_BLOCKS][()] == 1
+    finally:
+        tier.shutdown()
+
+
+def test_fs_tier_namespace_separates_model_partitions(tmp_path):
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    common = dict(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+        max_bytes=2 * _BLOCK_BYTES,
+    )
+    first = FileSystemTierManager(**common, cache_namespace="model-a")
+    second = FileSystemTierManager(**common, cache_namespace="model-b")
+    try:
+        assert first.file_mapper.base_path != second.file_mapper.base_path
+        assert "model-a" in first.file_mapper.base_path
+        assert "model-b" in second.file_mapper.base_path
+        first.submit_store(make_job(1, [key(1)], [0]))
+        second.submit_store(make_job(2, [key(1)], [0]))
+        assert all(result.success for result in drain(first))
+        assert all(result.success for result in drain(second))
+        assert os.path.exists(first.file_mapper.get_file_name(key(1)))
+        assert os.path.exists(second.file_mapper.get_file_name(key(1)))
+    finally:
+        first.shutdown()
+        second.shutdown()
+
+
+def test_fs_tier_namespace_rejects_path_traversal(tmp_path):
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    with pytest.raises(ValueError, match="cache_namespace"):
+        FileSystemTierManager(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=memoryview(tensor.numpy()),
+            tier_type="fs",
+            root_dir=str(tmp_path),
+            cache_namespace="../outside",
+        )
+
+
+def test_store_parent_chain_is_group_local_and_has_token_ranges(tmp_path):
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    tier = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+    )
+    keys = [
+        make_offload_key(b"a", 0),
+        make_offload_key(b"b", 1),
+        make_offload_key(b"c", 0),
+        make_offload_key(b"d", 1),
+    ]
+    try:
+        tier.submit_store(make_job(1, keys, [0, 1, 2, 3]))
+        assert all(result.success for result in drain(tier))
+        entries = tier._policy.entries
+        assert entries[keys[2].hex()].parent_key == keys[0].hex()
+        assert entries[keys[3].hex()].parent_key == keys[1].hex()
+        assert entries[keys[0].hex()].child_count == 1
+        assert entries[keys[1].hex()].child_count == 1
+        assert entries[keys[2].hex()].token_start == entries[keys[0].hex()].token_end
+        assert entries[keys[3].hex()].token_start == entries[keys[1].hex()].token_end
+        assert all(entry.observed_store_ms_ema > 0 for entry in entries.values())
+    finally:
+        tier.shutdown()
 
 
 def test_policy_metadata_survives_restart(tmp_path):

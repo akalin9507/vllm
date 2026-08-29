@@ -82,6 +82,10 @@ class PrefixCostAwareWTinyLFU:
         recency_half_life_seconds: float = 3600.0,
         prefix_weight: float = 1.0,
         prefill_tokens_per_second: float = 1000.0,
+        frequency_sketch_half_life_seconds: float = 3600.0,
+        window_ratio: float = 0.05,
+        probation_ratio: float = 0.20,
+        protected_ratio: float = 0.75,
     ) -> None:
         if recency_half_life_seconds <= 0:
             raise ValueError("recency_half_life_seconds must be positive")
@@ -89,10 +93,24 @@ class PrefixCostAwareWTinyLFU:
             raise ValueError("prefix_weight must be non-negative")
         if prefill_tokens_per_second <= 0:
             raise ValueError("prefill_tokens_per_second must be positive")
+        if frequency_sketch_half_life_seconds <= 0:
+            raise ValueError("frequency_sketch_half_life_seconds must be positive")
+        ratios = (window_ratio, probation_ratio, protected_ratio)
+        if any(ratio < 0 for ratio in ratios) or not math.isclose(sum(ratios), 1.0):
+            raise ValueError("cache segment ratios must be non-negative and sum to 1")
         self.recency_half_life_seconds = recency_half_life_seconds
         self.prefix_weight = prefix_weight
         self.prefill_tokens_per_second = prefill_tokens_per_second
+        self.frequency_sketch_half_life_seconds = (
+            frequency_sketch_half_life_seconds
+        )
+        self.segment_ratios = {
+            self.WINDOW: window_ratio,
+            self.PROBATION: probation_ratio,
+            self.PROTECTED: protected_ratio,
+        }
         self.sketch = FrequencySketch()
+        self._last_sketch_age = time.time()
         self.entries: dict[str, CacheEntry] = {}
         self._sessions: dict[str, set[str]] = {}
 
@@ -103,11 +121,11 @@ class PrefixCostAwareWTinyLFU:
             for _ in range(min(max(entry.access_count, 0), 32)):
                 self.sketch.increment(entry.cache_key)
 
-    def _decay(self, entry: CacheEntry, now: float) -> None:
+    def _effective_frequency(self, entry: CacheEntry, now: float) -> float:
         if entry.last_access_at <= 0:
-            return
+            return max(entry.decayed_frequency, 0.0)
         idle = max(now - entry.last_access_at, 0.0)
-        entry.decayed_frequency *= 0.5 ** (
+        return max(entry.decayed_frequency, 0.0) * 0.5 ** (
             idle / self.recency_half_life_seconds
         )
 
@@ -123,10 +141,10 @@ class PrefixCostAwareWTinyLFU:
         entry = self.entries.get(cache_key)
         if entry is None:
             return
-        self._decay(entry, now)
+        effective_frequency = self._effective_frequency(entry, now)
         entry.last_access_at = now
         entry.access_count += 1
-        entry.decayed_frequency += 1.0
+        entry.decayed_frequency = effective_frequency + 1.0
         if session_id is not None:
             sessions = self._sessions.setdefault(cache_key, set())
             sessions.add(session_id)
@@ -150,6 +168,11 @@ class PrefixCostAwareWTinyLFU:
             entry.access_count = previous.access_count
             entry.decayed_frequency = previous.decayed_frequency
             entry.distinct_session_count = previous.distinct_session_count
+            entry.child_count = previous.child_count
+            if entry.observed_load_ms_ema <= 0:
+                entry.observed_load_ms_ema = previous.observed_load_ms_ema
+            if entry.observed_store_ms_ema <= 0:
+                entry.observed_store_ms_ema = previous.observed_store_ms_ema
             entry.segment = previous.segment
             entry.created_at = previous.created_at
             if previous.parent_key != entry.parent_key:
@@ -180,20 +203,27 @@ class PrefixCostAwareWTinyLFU:
             parent = self.entries.get(entry.parent_key)
             if parent is not None:
                 parent.child_count = max(parent.child_count - 1, 0)
+        for child in self.entries.values():
+            if child.parent_key == cache_key:
+                child.parent_key = None
+                child.depth = 0
+                child.token_start = 0
+                child.token_end = child.token_count
         return entry
 
     def age(self, now: float | None = None) -> None:
         """Decay frequency and move stale protected entries to probation."""
         now = time.time() if now is None else now
         for entry in self.entries.values():
-            self._decay(entry, now)
             idle = max(now - entry.last_access_at, 0.0)
             if (
                 entry.segment == self.PROTECTED
                 and idle > 2 * self.recency_half_life_seconds
             ):
                 entry.segment = self.PROBATION
-        self.sketch.age()
+        if now - self._last_sketch_age >= self.frequency_sketch_half_life_seconds:
+            self.sketch.age()
+            self._last_sketch_age = now
 
     def make_entry(
         self,
@@ -206,9 +236,11 @@ class PrefixCostAwareWTinyLFU:
     ) -> CacheEntry:
         """Create candidate metadata using the configured prefill estimate."""
         depth = 0
+        token_start = 0
         if parent_key is not None:
             parent = self.entries.get(parent_key)
             depth = 1 if parent is None else parent.depth + 1
+            token_start = 0 if parent is None else parent.token_end
         return CacheEntry(
             cache_key=cache_key,
             path=path,
@@ -216,7 +248,8 @@ class PrefixCostAwareWTinyLFU:
             request_prefix_id=session_id,
             size_bytes=size_bytes,
             token_count=token_count,
-            token_end=token_count,
+            token_start=token_start,
+            token_end=token_start + token_count,
             created_at=time.time(),
             last_access_at=time.time(),
             decayed_frequency=float(self.sketch.estimate(cache_key)),
@@ -229,10 +262,9 @@ class PrefixCostAwareWTinyLFU:
     def score(self, entry: CacheEntry, now: float | None = None) -> float:
         """Return the retained value per byte; lower values evict first."""
         now = time.time() if now is None else now
-        self._decay(entry, now)
         idle = max(now - entry.last_access_at, 0.0)
         recency = math.exp(-idle / self.recency_half_life_seconds)
-        frequency = max(entry.decayed_frequency, 0.0) + 1.0
+        frequency = self._effective_frequency(entry, now) + 1.0
         shared_count = max(entry.distinct_session_count, 0) + max(
             entry.child_count, 0
         )
@@ -241,18 +273,14 @@ class PrefixCostAwareWTinyLFU:
             entry.estimated_prefill_ms - entry.observed_load_ms_ema, 0.0
         )
         prefix_bonus = 1.0 + self.prefix_weight / (1.0 + entry.depth)
-        segment_bonus = {
-            self.WINDOW: 0.75,
-            self.PROBATION: 0.9,
-            self.PROTECTED: 1.2,
-        }.get(entry.segment, 1.0)
+        one_hit_factor = 0.5 if entry.access_count <= 1 else 1.0
         return (
             frequency
             * (0.25 + 0.75 * recency)
             * shared_bonus
             * prefix_bonus
-            * max(compute_value, 1.0)
-            * segment_bonus
+            * compute_value
+            * one_hit_factor
             / max(entry.size_bytes, 1)
         )
 
@@ -280,7 +308,33 @@ class PrefixCostAwareWTinyLFU:
         """Select low-value READY entries until the requested space is free."""
         now = time.time() if now is None else now
         candidates = [entry for entry in entries if entry.state == "READY"]
-        candidates.sort(key=lambda entry: (self.score(entry, now), entry.path))
+        total_bytes = sum(entry.size_bytes for entry in candidates)
+        segment_bytes = {
+            segment: sum(
+                entry.size_bytes for entry in candidates if entry.segment == segment
+            )
+            for segment in self.segment_ratios
+        }
+        excess = {
+            segment: max(
+                segment_bytes[segment] - total_bytes * self.segment_ratios[segment],
+                0,
+            )
+            for segment in self.segment_ratios
+        }
+
+        def victim_key(entry: CacheEntry) -> tuple[int, float, str]:
+            if entry.segment == self.WINDOW and excess[self.WINDOW] > 0:
+                priority = 0
+            elif entry.segment == self.PROBATION and excess[self.PROBATION] > 0:
+                priority = 1
+            elif entry.segment == self.PROTECTED and excess[self.PROTECTED] > 0:
+                priority = 2
+            else:
+                priority = 3
+            return priority, self.score(entry, now), entry.path
+
+        candidates.sort(key=victim_key)
         victims: list[CacheEntry] = []
         freed = 0
         for entry in candidates:

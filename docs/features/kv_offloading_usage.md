@@ -127,9 +127,10 @@ The filesystem tier (`type: "fs"`) writes blocks to a filesystem directory.
 | --- | --- | --- | --- |
 | `type` | yes | — | Must be `fs`. |
 | `root_dir` | yes | — | Base directory; vLLM creates subdirectories beneath it (see [On-Disk Layout](#on-disk-layout)). |
+| `cache_namespace` | no | model/config namespace | Optional relative partition below `root_dir`, useful for tenant or deployment isolation. |
 | `n_read_threads` | no | `16` | Read-priority I/O threads (load path). |
 | `n_write_threads` | no | `16` | Write-priority I/O threads (store path). |
-| `max_bytes` | no | unlimited | Maximum block-data bytes for this rank's disk cache. The default optimized policy selects victims by frequency, prefix sharing, estimated Prefill savings, load cost, segment, and recency. `config.json` and temporary files are excluded. A batch larger than the limit is skipped without failing inference. |
+| `max_bytes` | no | unlimited | Maximum block-data bytes for this rank's disk cache. The default optimized policy selects victims by frequency, prefix sharing, estimated Prefill savings, load cost, segment, and recency. `config.json` and temporary files are excluded. A batch can be admitted partially; rejected blocks remain cache misses without failing inference. |
 | `cache_policy` | no | `prefix_cost_aware_wtinylfu` | Disk-tier admission and eviction policy. The optimized policy combines Count-Min Sketch admission with Window/Probation/Protected segments and prefix-cost-aware scoring. |
 | `enable_kv_events` | no | `false` | Publish `BlockStored` KV events (medium `FS`) for successfully stored blocks. Requires KV cache events to be enabled globally. |
 | `locality` | no | unspecified | `LOCAL` or `REMOTE` relative to the publishing vLLM instance. Included in the tier's KV events only when explicitly configured. |
@@ -138,12 +139,13 @@ Each thread group prefers its own queue but pulls from the other when its primar
 
 #### On-Disk Layout
 
-Under `root_dir`, vLLM creates a subdirectory `<model>_<digest>`, where `<model>` is the model name with `/` replaced by `_` (so HuggingFace IDs like `meta-llama/Llama-3-8B` don't nest), and `<digest>` is a short SHA256 prefix derived from the run configuration (model, block size, parallelism, dtype, etc.). Runs with the same configuration share the same subdirectory; runs with different configurations live side-by-side under the same `root_dir` without colliding.
+Under `root_dir`, vLLM creates a subdirectory `<model>_<digest>`, where `<model>` is the model name with `/` replaced by `_` (so HuggingFace IDs like `meta-llama/Llama-3-8B` don't nest), and `<digest>` is a short SHA256 prefix derived from the run configuration (model, block size, parallelism, dtype, etc.). Runs with the same configuration share the same subdirectory; runs with different configurations live side-by-side under the same `root_dir` without colliding. If `cache_namespace` is set, this layout is placed below `root_dir/<cache_namespace>/`.
 
 Inside that subdirectory, blocks are sharded across hash-prefix subdirectories to limit directory fan-out:
 
 ```text
 <root_dir>/
+  <cache_namespace>/       # optional operator-selected partition
   <model>_<digest>/
     config.json
   <model>_<digest>_r<rank>/
@@ -155,11 +157,22 @@ Inside that subdirectory, blocks are sharded across hash-prefix subdirectories t
 `config.json` records the run (block size, number of KV groups, etc.) and is written on first start. Each rank writes blocks under its own `_r<rank>` sibling directory, so multiple ranks can safely share the same `root_dir`.
 
 When `max_bytes` is set, the limit applies to the `.bin` block files under the
-current rank's directory. Policy metadata is persisted in a WAL-mode SQLite
+current rank's directory. The limit is per tier instance/namespace, not a
+global quota for the entire `root_dir`. For multiple models sharing one disk,
+assign each model a distinct `cache_namespace` and make the sum of their
+`max_bytes` values no greater than the disk budget. Policy metadata is persisted in a WAL-mode SQLite
 database and restored after restart. Blocks in `READING`, `WRITING`, or
-`EVICTING` state are protected; if a store batch cannot fit or loses the
-frequency admission comparison, it is skipped as a cache miss rather than
-surfacing an inference error.
+`EVICTING` state are protected. When a store batch cannot fit completely, the
+tier admits the blocks that fit and rejects the rest as cache misses rather
+than surfacing an inference error. A rejected block also stops admission of
+later blocks in the same KV-cache group so the persisted prefix chain remains
+valid.
+
+The FS tier exports cache-specific metrics through the normal vLLM metrics
+endpoint, including current bytes and entries, admission/rejection counts,
+partial or skipped batches, and eviction counts/bytes. Rejection reasons are
+available through the `reason` label (`capacity`, `policy`, `prefix_chain`, or
+`invalid_key`).
 
 The default `prefix_cost_aware_wtinylfu` policy maintains a Count-Min Sketch
 for frequency admission and three segments: `WINDOW`, `PROBATION`, and

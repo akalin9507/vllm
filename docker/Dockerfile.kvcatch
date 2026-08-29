@@ -4,11 +4,15 @@ COPY vllm/v1/kv_offload/tiering/fs/manager.py \
     /usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/tiering/fs/manager.py
 COPY vllm/v1/kv_offload/tiering/fs/io.py \
     /usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/tiering/fs/io.py
+COPY vllm/v1/kv_offload/file_mapper.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/file_mapper.py
 COPY vllm/v1/kv_offload/tiering/fs/policy.py \
     /usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/tiering/fs/policy.py
 COPY vllm/v1/kv_offload/tiering/spec.py \
     /usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/tiering/spec.py
-COPY start-kvcatch-vllm.sh /usr/local/bin/start-kvcatch-vllm.sh
+COPY docker/kvcatch_entrypoint.py /usr/local/bin/kvcatch_entrypoint.py
+
+ENTRYPOINT ["python3", "/usr/local/bin/kvcatch_entrypoint.py"]
 
 LABEL org.opencontainers.image.title="vllm-catch"
 LABEL org.opencontainers.image.description="vLLM 0.28.0 with bounded filesystem KV cache tier"

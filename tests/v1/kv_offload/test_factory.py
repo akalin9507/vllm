@@ -186,6 +186,15 @@ def test_tiering_spec_aligns_row_size():
     assert spec.num_blocks == 3
 
 
+def test_tiering_spec_rejects_less_than_one_cpu_chunk():
+    with pytest.raises(ValueError, match="at least one offloaded KV chunk"):
+        _create_spec(
+            spec_name="TieringOffloadingSpec",
+            cpu_bytes_to_use=7,
+            worker_kv_bytes_per_block=8,
+        )
+
+
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 def test_tiering_spec_replicated_sizing_removes_world_factor(world_size: int):
     worker_kv_bytes_per_block = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT

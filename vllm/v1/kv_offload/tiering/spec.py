@@ -257,6 +257,13 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
 
     def __init__(self, config: OffloadingConfig):
         super().__init__(config)
+        if self.kv_bytes_per_chunk > 0 and self.num_blocks == 0:
+            requested_bytes = int(self.extra_config["cpu_bytes_to_use"])
+            raise ValueError(
+                "cpu_bytes_to_use must be at least one offloaded KV chunk "
+                f"({self.kv_bytes_per_chunk} bytes); got {requested_bytes} bytes"
+            )
+
         # Redeclare for mypy: parent sets this but `--follow-imports skip` hides it
         self._manager: OffloadingManager | None = None
 
