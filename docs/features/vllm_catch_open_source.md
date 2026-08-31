@@ -17,6 +17,10 @@ The implementation is experimental. It is not a drop-in replacement for
 vLLM's general cache policy and currently targets a local filesystem mounted
 into the serving container.
 
+The Docker image enables WSL pinned host memory by default to improve
+CPU-to-GPU KV promotion bandwidth. Deployments that encounter WSL/CUDA pinned
+memory instability can override `VLLM_WSL2_ENABLE_PIN_MEMORY=0`.
+
 ## Reproducible Docker run
 
 Build from the repository root:

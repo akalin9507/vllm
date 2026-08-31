@@ -1,5 +1,7 @@
 FROM vllm/vllm-openai:v0.28.0
 
+ENV VLLM_WSL2_ENABLE_PIN_MEMORY=1
+
 COPY vllm/v1/kv_offload/tiering/fs/manager.py \
     /usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/tiering/fs/manager.py
 COPY vllm/v1/kv_offload/tiering/fs/io.py \

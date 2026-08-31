@@ -7,8 +7,10 @@ import math
 import sqlite3
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
+
+POLICY_VERSION = 2
 
 
 @dataclass
@@ -46,22 +48,17 @@ class FrequencySketch:
         self._counters = [[0] * width for _ in range(depth)]
 
     def _index(self, key: str, row: int) -> int:
-        digest = hashlib.blake2b(
-            f"{row}:{key}".encode(), digest_size=8
-        ).digest()
+        digest = hashlib.blake2b(f"{row}:{key}".encode(), digest_size=8).digest()
         return int.from_bytes(digest, "big") % self._width
 
     def increment(self, key: str) -> None:
         for row in range(self._depth):
             index = self._index(key, row)
-            self._counters[row][index] = min(
-                self._counters[row][index] + 1, 2**31 - 1
-            )
+            self._counters[row][index] = min(self._counters[row][index] + 1, 2**31 - 1)
 
     def estimate(self, key: str) -> int:
         return min(
-            self._counters[row][self._index(key, row)]
-            for row in range(self._depth)
+            self._counters[row][self._index(key, row)] for row in range(self._depth)
         )
 
     def age(self) -> None:
@@ -76,6 +73,9 @@ class PrefixCostAwareWTinyLFU:
     WINDOW = "WINDOW"
     PROBATION = "PROBATION"
     PROTECTED = "PROTECTED"
+    RESTORED_FREQUENCY_CAP = 8
+    SHARED_SESSION_CAP = 16
+    ADMISSION_SCORE_MARGIN = 1.1
 
     def __init__(
         self,
@@ -101,9 +101,7 @@ class PrefixCostAwareWTinyLFU:
         self.recency_half_life_seconds = recency_half_life_seconds
         self.prefix_weight = prefix_weight
         self.prefill_tokens_per_second = prefill_tokens_per_second
-        self.frequency_sketch_half_life_seconds = (
-            frequency_sketch_half_life_seconds
-        )
+        self.frequency_sketch_half_life_seconds = frequency_sketch_half_life_seconds
         self.segment_ratios = {
             self.WINDOW: window_ratio,
             self.PROBATION: probation_ratio,
@@ -114,11 +112,16 @@ class PrefixCostAwareWTinyLFU:
         self.entries: dict[str, CacheEntry] = {}
         self._sessions: dict[str, set[str]] = {}
 
-    def load(self, entries: Iterable[CacheEntry]) -> None:
-        """Restore metadata and seed the frequency sketch after a restart."""
+    def load(self, entries: Iterable[CacheEntry], now: float | None = None) -> None:
+        """Restore metadata and seed decayed, bounded frequency estimates."""
+        now = time.time() if now is None else now
         for entry in entries:
             self.entries[entry.cache_key] = entry
-            for _ in range(min(max(entry.access_count, 0), 32)):
+            restored_frequency = min(
+                max(math.floor(self._effective_frequency(entry, now) + 0.5), 0),
+                self.RESTORED_FREQUENCY_CAP,
+            )
+            for _ in range(restored_frequency):
                 self.sketch.increment(entry.cache_key)
 
     def _effective_frequency(self, entry: CacheEntry, now: float) -> float:
@@ -126,7 +129,17 @@ class PrefixCostAwareWTinyLFU:
             return max(entry.decayed_frequency, 0.0)
         idle = max(now - entry.last_access_at, 0.0)
         return max(entry.decayed_frequency, 0.0) * 0.5 ** (
-            idle / self.recency_half_life_seconds
+            idle / self.frequency_sketch_half_life_seconds
+        )
+
+    def _effective_session_count(self, entry: CacheEntry, now: float) -> float:
+        if entry.last_access_at <= 0:
+            return min(max(entry.distinct_session_count, 0), self.SHARED_SESSION_CAP)
+        idle = max(now - entry.last_access_at, 0.0)
+        return min(
+            max(entry.distinct_session_count, 0)
+            * 0.5 ** (idle / self.recency_half_life_seconds),
+            self.SHARED_SESSION_CAP,
         )
 
     def record_access(
@@ -142,14 +155,16 @@ class PrefixCostAwareWTinyLFU:
         if entry is None:
             return
         effective_frequency = self._effective_frequency(entry, now)
+        effective_sessions = self._effective_session_count(entry, now)
         entry.last_access_at = now
         entry.access_count += 1
         entry.decayed_frequency = effective_frequency + 1.0
         if session_id is not None:
             sessions = self._sessions.setdefault(cache_key, set())
             sessions.add(session_id)
-            entry.distinct_session_count = max(
-                entry.distinct_session_count, len(sessions)
+            entry.distinct_session_count = min(
+                max(math.ceil(effective_sessions), len(sessions)),
+                self.SHARED_SESSION_CAP,
             )
         if entry.segment == self.WINDOW and entry.access_count > 1:
             entry.segment = self.PROBATION
@@ -265,7 +280,7 @@ class PrefixCostAwareWTinyLFU:
         idle = max(now - entry.last_access_at, 0.0)
         recency = math.exp(-idle / self.recency_half_life_seconds)
         frequency = self._effective_frequency(entry, now) + 1.0
-        shared_count = max(entry.distinct_session_count, 0) + max(
+        shared_count = self._effective_session_count(entry, now) + max(
             entry.child_count, 0
         )
         shared_bonus = 1.0 + math.log2(1.0 + shared_count)
@@ -289,15 +304,15 @@ class PrefixCostAwareWTinyLFU:
         candidate: CacheEntry,
         victim_candidates: list[CacheEntry],
     ) -> bool:
-        """Reject one-hit pollution when a victim has equal frequency."""
+        """Admit candidates whose current retained value beats a victim."""
         if not victim_candidates:
             return True
         victim = min(victim_candidates, key=self.score)
         candidate_frequency = self.sketch.estimate(candidate.cache_key)
         victim_frequency = self.sketch.estimate(victim.cache_key)
-        if candidate_frequency != victim_frequency:
-            return candidate_frequency > victim_frequency
-        return self.score(candidate) > self.score(victim) * 2.0
+        if candidate_frequency > victim_frequency:
+            return True
+        return self.score(candidate) > self.score(victim) * self.ADMISSION_SCORE_MARGIN
 
     def select_victims(
         self,
@@ -350,9 +365,7 @@ class CacheMetadataStore:
 
     def __init__(self, path: str) -> None:
         self._lock = threading.RLock()
-        self._connection = sqlite3.connect(
-            path, timeout=30, check_same_thread=False
-        )
+        self._connection = sqlite3.connect(path, timeout=30, check_same_thread=False)
         with self._lock:
             self._connection.execute("PRAGMA journal_mode=WAL")
             self._connection.execute("PRAGMA synchronous=NORMAL")
@@ -382,14 +395,45 @@ class CacheMetadataStore:
                 )
                 """
             )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            self._connection.commit()
+
+    def policy_version(self) -> int:
+        """Return the persisted policy schema/behavior version."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT value FROM metadata WHERE key = 'policy_version'"
+            ).fetchone()
+        if row is None:
+            return 0
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return 0
+
+    def set_policy_version(self, version: int) -> None:
+        """Persist the active policy behavior version."""
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO metadata(key, value) VALUES ('policy_version', ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (str(version),),
+            )
             self._connection.commit()
 
     def load(self) -> list[CacheEntry]:
         """Load all persisted entries."""
         with self._lock:
-            rows = self._connection.execute(
-                "SELECT * FROM entries"
-            ).fetchall()
+            rows = self._connection.execute("SELECT * FROM entries").fetchall()
         return [CacheEntry(*row) for row in rows]
 
     def save(self, entries: Iterable[CacheEntry]) -> None:

@@ -11,6 +11,10 @@ The entrypoint accepts the most important model, runtime, and filesystem KV
 cache settings. Use `--dry-run` to inspect the generated `vllm serve`
 command without allocating a GPU:
 
+The image enables `VLLM_WSL2_ENABLE_PIN_MEMORY=1` by default so WSL deployments
+can use pinned host memory for faster CPU-to-GPU KV promotion. Override the
+environment variable only if the local WSL/CUDA combination is unstable.
+
 ```bash
 docker run --rm vllm-catch:v0.28.0-configurable \
   --model /models/llama \

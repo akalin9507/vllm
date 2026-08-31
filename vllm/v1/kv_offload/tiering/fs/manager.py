@@ -46,8 +46,8 @@ from vllm.v1.kv_offload.base import (
     OffloadingMetricMetadata,
     OffloadKey,
     ReqContext,
-    make_offload_key,
     get_offload_group_idx,
+    make_offload_key,
 )
 from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.kv_offload.tiering.async_lookup import AsyncLookupManager
@@ -64,12 +64,13 @@ from vllm.v1.kv_offload.tiering.fs.io import (
     batch_store_block,
     probe_o_direct,
 )
-from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 from vllm.v1.kv_offload.tiering.fs.policy import (
+    POLICY_VERSION,
     CacheEntry,
     CacheMetadataStore,
     PrefixCostAwareWTinyLFU,
 )
+from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
 if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
@@ -221,9 +222,7 @@ class FileSystemTierManager(SecondaryTierManager):
         if max_bytes is not None and max_bytes < 0:
             raise ValueError("max_bytes must be a non-negative integer or None")
         if cache_policy != "prefix_cost_aware_wtinylfu":
-            raise ValueError(
-                "cache_policy must be 'prefix_cost_aware_wtinylfu'"
-            )
+            raise ValueError("cache_policy must be 'prefix_cost_aware_wtinylfu'")
         self.max_bytes = max_bytes
         self.cache_policy = cache_policy
         self.locality = Locality(locality) if locality is not None else None
@@ -282,9 +281,7 @@ class FileSystemTierManager(SecondaryTierManager):
             recency_half_life_seconds=recency_half_life_seconds,
             prefix_weight=prefix_weight,
             prefill_tokens_per_second=prefill_tokens_per_second,
-            frequency_sketch_half_life_seconds=(
-                frequency_sketch_half_life_seconds
-            ),
+            frequency_sketch_half_life_seconds=(frequency_sketch_half_life_seconds),
             window_ratio=window_ratio,
             probation_ratio=probation_ratio,
             protected_ratio=protected_ratio,
@@ -298,10 +295,9 @@ class FileSystemTierManager(SecondaryTierManager):
                     self.file_mapper.get_run_config(), f, indent=2, sort_keys=True
                 )
 
-        self._metadata = CacheMetadataStore(
-            f"{self._storage_dir}.metadata.sqlite3"
-        )
+        self._metadata = CacheMetadataStore(f"{self._storage_dir}.metadata.sqlite3")
         self._policy.load(self._metadata.load())
+        self._metadata.set_policy_version(POLICY_VERSION)
 
         with self._capacity_lock:
             self._refresh_entries_locked()
@@ -325,9 +321,7 @@ class FileSystemTierManager(SecondaryTierManager):
             thread_name_prefix="vllm_kv_py_fs",
         )
 
-        self._lookup_manager = FsAsyncLookupManager(
-            tier=self, tier_type=self.tier_type
-        )
+        self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
 
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
@@ -379,9 +373,7 @@ class FileSystemTierManager(SecondaryTierManager):
                         files[path] = (key, stat.st_size)
 
         current_keys = {key.hex() for key, _ in files.values()}
-        stale_keys = [
-            key for key in self._policy.entries if key not in current_keys
-        ]
+        stale_keys = [key for key in self._policy.entries if key not in current_keys]
         for cache_key in stale_keys:
             self._policy.on_remove(cache_key)
         if stale_keys:
@@ -506,7 +498,8 @@ class FileSystemTierManager(SecondaryTierManager):
 
     def _drop_request_tails_locked(self, cache_key: str) -> None:
         stale_tails = [
-            tail for tail, value in self._request_group_tails.items()
+            tail
+            for tail, value in self._request_group_tails.items()
             if value == cache_key
         ]
         for tail in stale_tails:
@@ -546,9 +539,7 @@ class FileSystemTierManager(SecondaryTierManager):
         """Admit as many blocks as fit while preserving prefix chains."""
         unique_paths = list(dict.fromkeys(paths))
         existing_paths = [path for path in unique_paths if os.path.exists(path)]
-        missing_paths = [
-            path for path in unique_paths if not os.path.exists(path)
-        ]
+        missing_paths = [path for path in unique_paths if not os.path.exists(path)]
         self._increase_counter(self.ADMISSION_ATTEMPTS, len(missing_paths))
         if self.max_bytes is None:
             self._increase_counter(self.ADMITTED_BLOCKS, len(missing_paths))
@@ -567,9 +558,7 @@ class FileSystemTierManager(SecondaryTierManager):
 
         def select_victims(required_blocks: int) -> list[CacheEntry]:
             bytes_to_free = max(
-                current_bytes
-                + required_blocks * self._block_size
-                - self.max_bytes,
+                current_bytes + required_blocks * self._block_size - self.max_bytes,
                 0,
             )
             if bytes_to_free == 0:
@@ -608,15 +597,14 @@ class FileSystemTierManager(SecondaryTierManager):
                 - self.max_bytes,
                 0,
             )
-            if required_bytes > 0 and sum(
-                victim.size_bytes for victim in victims
-            ) < required_bytes:
+            if (
+                required_bytes > 0
+                and sum(victim.size_bytes for victim in victims) < required_bytes
+            ):
                 blocked_groups.add(group_idx)
                 self._record_admission_rejection("capacity")
                 continue
-            if required_bytes > 0 and not self._policy.should_admit(
-                candidate, victims
-            ):
+            if required_bytes > 0 and not self._policy.should_admit(candidate, victims):
                 blocked_groups.add(group_idx)
                 self._record_admission_rejection("policy")
                 continue
@@ -636,14 +624,13 @@ class FileSystemTierManager(SecondaryTierManager):
 
         final_victims = select_victims(len(admitted_missing))
         required_bytes = max(
-            current_bytes
-            + len(admitted_missing) * self._block_size
-            - self.max_bytes,
+            current_bytes + len(admitted_missing) * self._block_size - self.max_bytes,
             0,
         )
-        if required_bytes > 0 and sum(
-            victim.size_bytes for victim in final_victims
-        ) < required_bytes:
+        if (
+            required_bytes > 0
+            and sum(victim.size_bytes for victim in final_victims) < required_bytes
+        ):
             accepted_paths = existing_paths
             admitted_missing.clear()
             final_victims = []
@@ -811,12 +798,9 @@ class FileSystemTierManager(SecondaryTierManager):
                     if os.path.exists(path):
                         entry.state = "READY"
                         if transfer_time is not None:
-                            sample_ms = transfer_time * 1000 / max(
-                                len(load_paths), 1
-                            )
+                            sample_ms = transfer_time * 1000 / max(len(load_paths), 1)
                             entry.observed_load_ms_ema = (
-                                0.2 * sample_ms
-                                + 0.8 * entry.observed_load_ms_ema
+                                0.2 * sample_ms + 0.8 * entry.observed_load_ms_ema
                             )
                     else:
                         self._policy.on_remove(key.hex())
@@ -926,9 +910,7 @@ class FileSystemTierManager(SecondaryTierManager):
         self._lookup_manager.cleanup(req_context.req_id)
         with self._capacity_lock:
             stale_tails = [
-                key
-                for key in self._request_group_tails
-                if key[0] == req_context.req_id
+                key for key in self._request_group_tails if key[0] == req_context.req_id
             ]
             for key in stale_tails:
                 del self._request_group_tails[key]

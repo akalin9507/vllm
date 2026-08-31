@@ -41,6 +41,7 @@ from vllm.v1.kv_offload.tiering.fs.manager import (
     FileSystemTierManager,
 )
 from vllm.v1.kv_offload.tiering.fs.policy import (
+    POLICY_VERSION,
     CacheEntry,
     CacheMetadataStore,
     FrequencySketch,
@@ -400,7 +401,10 @@ def test_frequency_sketch_counts_and_ages():
 
 
 def test_policy_score_is_pure_and_frequency_decay_is_not_compounded():
-    policy = PrefixCostAwareWTinyLFU(recency_half_life_seconds=10.0)
+    policy = PrefixCostAwareWTinyLFU(
+        recency_half_life_seconds=10.0,
+        frequency_sketch_half_life_seconds=10.0,
+    )
     entry = CacheEntry(
         cache_key="stable",
         path="stable",
@@ -418,9 +422,7 @@ def test_policy_score_is_pure_and_frequency_decay_is_not_compounded():
 
 
 def test_policy_sketch_ages_only_after_configured_half_life():
-    policy = PrefixCostAwareWTinyLFU(
-        frequency_sketch_half_life_seconds=10.0
-    )
+    policy = PrefixCostAwareWTinyLFU(frequency_sketch_half_life_seconds=10.0)
     policy._last_sketch_age = 100.0
     policy.sketch.increment("hot")
     policy.sketch.increment("hot")
@@ -432,7 +434,7 @@ def test_policy_sketch_ages_only_after_configured_half_life():
 
 def test_policy_rejects_one_hit_candidate_against_equal_frequency():
     policy = PrefixCostAwareWTinyLFU()
-    now = 100.0
+    now = time.time()
     victim = CacheEntry(
         cache_key="victim",
         path="victim",
@@ -441,12 +443,77 @@ def test_policy_rejects_one_hit_candidate_against_equal_frequency():
         created_at=now,
         last_access_at=now,
         decayed_frequency=1.0,
+        estimated_prefill_ms=100.0,
     )
     policy.on_store(victim, now=now)
     policy.record_access("victim", now=now, session_id="s1")
     candidate = policy.make_entry("candidate", "candidate", 100, 100)
     policy.sketch.increment("candidate")
     assert not policy.should_admit(candidate, [victim])
+
+
+def test_policy_restores_only_recent_bounded_frequency():
+    policy = PrefixCostAwareWTinyLFU(frequency_sketch_half_life_seconds=10.0)
+    recent = CacheEntry(
+        cache_key="recent",
+        path="recent",
+        size_bytes=100,
+        last_access_at=80.0,
+        access_count=2057,
+        decayed_frequency=32.0,
+    )
+    stale = CacheEntry(
+        cache_key="stale",
+        path="stale",
+        size_bytes=100,
+        last_access_at=20.0,
+        access_count=2057,
+        decayed_frequency=32.0,
+    )
+
+    policy.load([recent, stale], now=100.0)
+
+    assert policy.sketch.estimate("recent") == policy.RESTORED_FREQUENCY_CAP
+    assert policy.sketch.estimate("stale") == 0
+
+
+def test_policy_decays_and_caps_persisted_session_popularity():
+    policy = PrefixCostAwareWTinyLFU(recency_half_life_seconds=10.0)
+    entry = CacheEntry(
+        cache_key="shared",
+        path="shared",
+        size_bytes=100,
+        last_access_at=100.0,
+        distinct_session_count=574,
+    )
+
+    assert policy._effective_session_count(entry, now=160.0) == pytest.approx(574 / 64)
+
+
+def test_policy_admits_new_value_over_stale_historical_victim():
+    now = time.time()
+    policy = PrefixCostAwareWTinyLFU(
+        recency_half_life_seconds=3600.0,
+        frequency_sketch_half_life_seconds=3600.0,
+    )
+    victim = CacheEntry(
+        cache_key="victim",
+        path="victim",
+        size_bytes=100,
+        token_count=100,
+        created_at=now - 36000.0,
+        last_access_at=now - 36000.0,
+        access_count=2057,
+        decayed_frequency=32.0,
+        estimated_prefill_ms=100.0,
+        distinct_session_count=574,
+    )
+    policy.load([victim], now=now)
+    candidate = policy.make_entry("candidate", "candidate", 100, 100)
+    candidate.estimated_prefill_ms = 100.0
+    policy.sketch.increment(candidate.cache_key)
+
+    assert policy.should_admit(candidate, [victim])
 
 
 def test_policy_retains_shared_high_cost_prefix():
@@ -638,8 +705,15 @@ def test_policy_metadata_survives_restart(tmp_path):
     restored = CacheMetadataStore(str(tmp_path / "entries.sqlite3"))
     try:
         assert restored.load() == [entry]
+        assert restored.policy_version() == 0
+        restored.set_policy_version(POLICY_VERSION)
     finally:
         restored.close()
+    versioned = CacheMetadataStore(str(tmp_path / "entries.sqlite3"))
+    try:
+        assert versioned.policy_version() == POLICY_VERSION
+    finally:
+        versioned.close()
 
 
 def test_fs_tier_skips_batch_larger_than_capacity_without_error(tmp_path):
